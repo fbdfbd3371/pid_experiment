@@ -1,12 +1,9 @@
-// PracticeV2_Experiment_EN_RelayCalOnly_UISet.ino
+// PracticeV2_Experiment_EN_RelayCalOnly_UISet_Chart.ino
 // ESP8266 + PID balance with web UI (STA → phone AP "s10").
-// Changes vs previous:
-//   • Relay turns ON only right before calibration (arming). Never toggled afterwards.
-//   • 10 s boot hold before calibration.
-//   • Before Start: PID OFF, ESCs at MIN, motors do not spin.
-//   • On Start: first Slew to Base, then run PID for 20 s; Wi‑Fi/HTTP paused during run.
-//   • Web UI (EN): Kp/Ki/Kd + Invert checkbox, big red "EXPERIMENT STARTED" banner.
-//   • New /set endpoint. Inputs auto-apply with debounce; refresh won't overwrite recent edits.
+// Additions in this version:
+//   • During experiment, sample potentiometer every 50 ms (raw + filtered + error).
+//   • After experiment, the page can fetch samples and render a line chart (no external libs).
+//   • Data exposed via /data in compact JSON.
 //
 // ---------------------------------------------------------------
 
@@ -33,8 +30,8 @@ static       int SlewStepUs = 4;
 static       int   PotCenter  = 660;
 static const int   PotMinSafe = 300;
 static const int   PotMaxSafe = 900;
-static       float PotAlpha   = 0.20f;
-static       float DAlpha     = 0.20f;
+static       float PotAlpha   = 0.20f; // EMA for measurement
+static       float DAlpha     = 0.20f; // EMA for derivative
 static       bool  InvertDirection = false;
 
 static const int LoopDtMs = 10; // ~100 Hz
@@ -82,6 +79,22 @@ static uint32_t ExperimentEndMs = 0;
 // Serial printing throttle
 static const uint32_t PrintEveryMs = 120;
 static uint32_t LastPrintMs = 0;
+
+// =============================
+// Sampling buffer (50 ms period, up to 500 samples)
+// =============================
+static const uint16_t SamplePeriodMs = 50;
+static const int      MaxSamples     = 500; // 20 s / 50 ms = 400; reserve some headroom
+
+static uint16_t SampleCount = 0;
+static uint16_t Tms   [MaxSamples]; // time since start, ms (fits up to 65s)
+static uint16_t AdcRaw[MaxSamples]; // 0..1023
+static int16_t  AdcErr[MaxSamples]; // error (center - filtered), may be negative
+static uint16_t AdcFilt[MaxSamples];// filtered value for reference
+
+static uint32_t NextSampleAtMs = 0;
+static uint32_t ExperimentStartMs = 0;
+static volatile bool SamplesReady = false;
 
 // =============================
 // Utils
@@ -197,20 +210,46 @@ void ControlStepPID(){
 }
 
 // =============================
-// Web page (EN) with red banner and live apply
+// Sampling during experiment
+// =============================
+inline void TrySample(){
+  if (!ExperimentRunning) return;
+  uint32_t now = millis();
+  if (now < NextSampleAtMs) return;
+  if (SampleCount >= MaxSamples) return;
+
+  int raw = analogRead(PinPot);
+  // PotFiltered already updated in ControlStepPID()
+  int err = PotCenter - PotFiltered;
+  if (InvertDirection) err = -err;
+
+  uint16_t t = (uint16_t)(now - ExperimentStartMs);
+  Tms   [SampleCount] = t;
+  AdcRaw[SampleCount] = (uint16_t)ClampInt(raw, 0, 1023);
+  AdcFilt[SampleCount]= (uint16_t)ClampInt(PotFiltered, 0, 1023);
+  AdcErr[SampleCount] = (int16_t)ClampInt(err, -32768, 32767);
+
+  SampleCount++;
+  NextSampleAtMs += SamplePeriodMs;
+}
+
+// =============================
+// Web page (EN) with red banner, live apply, and chart
 // =============================
 static const char* HTML_PAGE PROGMEM = R"HTML(
 <!doctype html>
 <meta name=viewport content="width=device-width, initial-scale=1">
 <title>BalanceRig — Experiment</title>
 <style>
-  body{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:720px;margin:24px auto;padding:0 12px}
+  body{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:760px;margin:24px auto;padding:0 12px}
   fieldset{border:1px solid #ddd;border-radius:12px;padding:12px;margin-bottom:12px}
   label{display:block;margin:8px 0 4px}
   input[type=number]{width:140px;padding:6px}
   button{padding:10px 14px;border-radius:12px;border:1px solid #bbb;cursor:pointer}
   #status{font:13px/1.5 monospace;background:#fafafa;border:1px solid #eee;border-radius:12px;padding:10px;white-space:pre-wrap}
   #banner{font-size:28px;color:#C00020;font-weight:900;text-align:center;margin:14px 0;display:none}
+  #chartWrap{border:1px solid #eee;border-radius:12px;padding:10px}
+  canvas{width:100%; height:280px;}
 </style>
 <h1>BalanceRig — Experiment (20 s)</h1>
 
@@ -230,9 +269,19 @@ static const char* HTML_PAGE PROGMEM = R"HTML(
   <div id=status>Ready. Motors are OFF until you press Start.</div>
 </fieldset>
 
+<fieldset id="chartWrap">
+  <legend>Chart (after experiment)</legend>
+  <div style="display:flex;gap:8px;align-items:center">
+    <button onclick="loadChart()">Load chart</button>
+    <small id=meta>—</small>
+  </div>
+  <canvas id="chart" width="800" height="280"></canvas>
+</fieldset>
+
 <script>
-let dirtyUntil = 0;     // time until which refresh must not overwrite fields after a local edit
+let dirtyUntil = 0;
 let debounceT = null;
+let wasRunning = false;
 
 function debounce(fn, ms){
   return function(...args){
@@ -247,7 +296,7 @@ const applyNow = debounce(async function(){
     kd: document.getElementById('kd').value,
     invert: document.getElementById('invert').checked ? '1' : '0'
   });
-  dirtyUntil = Date.now() + 800; // prevent refresh from overwriting for a short time
+  dirtyUntil = Date.now() + 800;
   try{ await fetch('/set?'+params.toString()).then(r=>r.json()); }catch(e){}
 }, 220);
 
@@ -273,7 +322,7 @@ async function refresh(){
     const el=document.getElementById(id);
     if(!el) return;
     const active = (document.activeElement===el);
-    if(active || now < dirtyUntil) return; // do not overwrite while editing or right after
+    if(active || now < dirtyUntil) return;
     if(id==='invert'){ el.checked=!!val; } else { el.value=val; }
   };
   F('kp', s.kp); F('ki', s.ki); F('kd', s.kd); F('invert', s.invert);
@@ -283,17 +332,102 @@ async function refresh(){
     `Motors: ${s.running? 'ON' : 'OFF (waiting for Start)'}`;
   btn.disabled = s.running ? true : false;
   document.getElementById('banner').style.display = s.running ? 'block' : 'none';
+
+  // Auto-load chart once when experiment ends
+  if (wasRunning && !s.running) {
+    loadChart();
+  }
+  wasRunning = !!s.running;
 }
 
 async function startExp(){
   document.getElementById('banner').style.display = 'block';
   document.getElementById('status').textContent = 'Experiment starting...';
   document.getElementById('btn').disabled = true;
-  // ensure latest edits are applied to device before start
   await applyNow();
   try{ await fetch('/start').then(r=>r.json()); }catch(e){}
 }
 
+async function loadChart(){
+  const meta = document.getElementById('meta');
+  meta.textContent = 'Loading...';
+  let d = null;
+  try{
+    d = await fetch('/data').then(r=>r.json());
+  }catch(e){
+    meta.textContent = 'No data (run an experiment first).';
+    return;
+  }
+  if(!d || !d.ok || !d.count){
+    meta.textContent = 'No data (run an experiment first).';
+    return;
+  }
+  meta.textContent = `Samples: ${d.count}, dt=${d.dt_ms} ms`;
+  drawChart(d.t, d.adc_raw, d.adc_filt, d.err);
+}
+
+function drawChart(t, raw, filt, err){
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+  ctx.save();
+  // axes
+  ctx.strokeStyle = '#999';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(40, 10);
+  ctx.lineTo(40, H-30);
+  ctx.lineTo(W-10, H-30);
+  ctx.stroke();
+  // scaling
+  const n = raw.length;
+  const xmin = 0, xmax = t[n-1]||1;
+  const ymin = 0, ymax = 1023;
+  const x = (i)=> 40 + (W-50)*(t[i]-xmin)/(xmax-xmin||1);
+  const y = (v)=> (H-30) - (H-40)*(v-ymin)/(ymax-ymin||1);
+
+  // grid (time)
+  ctx.strokeStyle = '#eee';
+  for(let ms=0; ms<=xmax; ms+=1000){
+    const gx = 40 + (W-50)*(ms-xmin)/(xmax-xmin||1);
+    ctx.beginPath(); ctx.moveTo(gx,10); ctx.lineTo(gx,H-30); ctx.stroke();
+  }
+  // labels
+  ctx.fillStyle = '#333';
+  ctx.fillText('time, ms', W-70, H-12);
+  ctx.fillText('ADC', 8, 20);
+
+  // plot raw
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for(let i=0;i<n;i++){
+    const xi=x(i), yi=y(raw[i]);
+    if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);
+  }
+  ctx.stroke();
+
+  // plot filtered
+  ctx.strokeStyle = '#1a73e8';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for(let i=0;i<n;i++){
+    const xi=x(i), yi=y(filt[i]);
+    if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);
+  }
+  ctx.stroke();
+
+  // target/center line
+  ctx.strokeStyle = '#e8711a';
+  ctx.setLineDash([4,4]);
+  ctx.beginPath();
+  const yc = y(%POT_CENTER%);
+  ctx.moveTo(40, yc); ctx.lineTo(W-10, yc); ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.restore();
+}
 setInterval(refresh, 500);
 refresh();
 </script>
@@ -307,7 +441,12 @@ static void SendJsonOk(){ Web.send(200, "application/json", "{\"ok\":true}"); }
 // =============================
 // HTTP handlers
 // =============================
-void HandleRoot(){ Web.send_P(200, "text/html", HTML_PAGE); }
+void HandleRoot(){
+  // Inject PotCenter value into HTML once (for center line)
+  String page = String(HTML_PAGE);
+  page.replace("%POT_CENTER%", String(PotCenter));
+  Web.send(200, "text/html", page);
+}
 
 void HandleState(){
   int adc = analogRead(PinPot);
@@ -347,10 +486,16 @@ void HandleSet(){
 void HandleStart(){
   if (ExperimentRunning) { Web.send(200, "application/json", "{\"ok\":false,\"msg\":\"already_running\"}"); return; }
 
-  // Clean PID state
+  // Reset PID state
   IntUs = 0.0f;
   DerivFilt = 0.0f;
   LastTsMs = millis();
+
+  // Reset sampling
+  SampleCount = 0;
+  SamplesReady = false;
+  ExperimentStartMs = millis();
+  NextSampleAtMs = ExperimentStartMs; // sample immediately at t=0
 
   // Move both channels softly to Base before enabling PID loop
   SlewBothTo(BaseUs, BaseUs);
@@ -366,6 +511,40 @@ void HandleStart(){
   WiFi.forceSleepBegin();
   delay(1);
 #endif
+}
+
+void HandleData(){
+  if (!SamplesReady || SampleCount==0){
+    Web.send(200, "application/json", "{\"ok\":false,\"msg\":\"no_data\"}");
+    return;
+  }
+  String j = "{";
+  j += "\"ok\":true,";
+  j += "\"count\":" + String(SampleCount) + ",";
+  j += "\"dt_ms\":" + String(SamplePeriodMs) + ",";
+
+  // Times
+  j += "\"t\":[";
+  for (uint16_t i=0;i<SampleCount;i++){ j += String(Tms[i]); if (i+1<SampleCount) j += ","; }
+  j += "],";
+
+  // Raw
+  j += "\"adc_raw\":[";
+  for (uint16_t i=0;i<SampleCount;i++){ j += String(AdcRaw[i]); if (i+1<SampleCount) j += ","; }
+  j += "],";
+
+  // Filtered
+  j += "\"adc_filt\":[";
+  for (uint16_t i=0;i<SampleCount;i++){ j += String(AdcFilt[i]); if (i+1<SampleCount) j += ","; }
+  j += "],";
+
+  // Error
+  j += "\"err\":[";
+  for (uint16_t i=0;i<SampleCount;i++){ j += String(AdcErr[i]); if (i+1<SampleCount) j += ","; }
+  j += "]";
+
+  j += "}";
+  Web.send(200, "application/json", j);
 }
 
 // =============================
@@ -392,6 +571,7 @@ void StartHttpServer(){
   Web.on("/state", HandleState);
   Web.on("/set", HandleSet);
   Web.on("/start", HandleStart);
+  Web.on("/data", HandleData);
   Web.begin();
   LOGF("HTTP server started.\n");
 }
@@ -452,12 +632,14 @@ void loop(){
 
   // === Experiment running ===
   ControlStepPID();
+  TrySample(); // sample every 50 ms
   PrintStateOnce();
 
   if ((int32_t)(millis()-ExperimentEndMs) >= 0){
     // Stop experiment: set outputs to MIN; relay remains ON (unchanged)
     ExperimentRunning=false;
     HoldEscMin();
+    SamplesReady = true; // allow /data to be served
 
 #if DisableWifiDuringExperiment
     WiFi.forceSleepWake();
