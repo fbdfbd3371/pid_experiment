@@ -91,6 +91,9 @@ static uint16_t Tms   [MaxSamples]; // time since start, ms (fits up to 65s)
 static uint16_t AdcRaw[MaxSamples]; // 0..1023
 static int16_t  AdcErr[MaxSamples]; // error (center - filtered), may be negative
 static uint16_t AdcFilt[MaxSamples];// filtered value for reference
+static int16_t  PUs[MaxSamples]; // P term (µs, signed)
+static int16_t  IUs[MaxSamples]; // I term (µs, signed)
+static int16_t  DUs[MaxSamples]; // D term (µs, signed)
 
 static uint32_t NextSampleAtMs = 0;
 static uint32_t ExperimentStartMs = 0;
@@ -229,6 +232,16 @@ inline void TrySample(){
   AdcFilt[SampleCount]= (uint16_t)ClampInt(PotFiltered, 0, 1023);
   AdcErr[SampleCount] = (int16_t)ClampInt(err, -32768, 32767);
 
+  // PID components for logging (µs)
+  float uP = KpUsPerCount * err;
+  float uI = IntUs;
+  float uD = -KdUsPerCountPerSec * DerivFilt;
+  auto clamp16 = [](float v, int lim){ if(v>lim) v=lim; if(v<-lim) v=-lim; return (int16_t)v; };
+  const int limUs = 2000;
+  PUs[SampleCount] = clamp16(uP, limUs);
+  IUs[SampleCount] = clamp16(uI, limUs);
+  DUs[SampleCount] = clamp16(uD, limUs);
+
   SampleCount++;
   NextSampleAtMs += SamplePeriodMs;
 }
@@ -276,7 +289,14 @@ static const char* HTML_PAGE PROGMEM = R"HTML(
     <button onclick="savePng()">Save PNG</button>
     <small id=meta>—</small>
   </div>
-  <canvas id="chart" width="800" height="280"></canvas>
+  <div id="chartWrap">
+    <div style="font-weight:600;margin:6px 0">Potentiometer (raw & filtered), ADC</div>
+    <canvas id="chartPot" width="800" height="220"></canvas>
+    <div style="font-weight:600;margin:14px 0 6px">Error, ADC</div>
+    <canvas id="chartErr" width="800" height="180"></canvas>
+    <div style="font-weight:600;margin:14px 0 6px">PID components, µs (P / I / D)</div>
+    <canvas id="chartPid" width="800" height="220"></canvas>
+  </div>
 </fieldset>
 
 <script>
@@ -377,69 +397,67 @@ async function loadChart(){
     return;
   }
   meta.textContent = `Samples: ${d.count}, dt=${d.dt_ms} ms`;
-  drawChart(d.t, d.adc_raw, d.adc_filt, d.err);
+  drawPotChart(d.t, d.adc_raw, d.adc_filt, %POT_CENTER%);
+  drawErrChart(d.t, d.err);
+  drawPidChart(d.t, d.p, d.i, d.d);
 }
 
-function drawChart(t, raw, filt, err){
-  const canvas = document.getElementById('chart');
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  ctx.clearRect(0,0,W,H);
-  ctx.save();
-  // axes
-  ctx.strokeStyle = '#999';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(40, 10);
-  ctx.lineTo(40, H-30);
-  ctx.lineTo(W-10, H-30);
-  ctx.stroke();
-  // scaling
-  const n = raw.length;
-  const xmin = 0, xmax = t[n-1]||1;
+function drawPotChart(t, raw, filt, potCenter){
+  const c = document.getElementById("chartPot");
+  const ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  ctx.clearRect(0,0,W,H); ctx.save();
+  ctx.strokeStyle = "#999"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(40,10); ctx.lineTo(40,H-30); ctx.lineTo(W-10,H-30); ctx.stroke();
+  const n = raw.length; const xmin = 0, xmax = t[n-1]||1;
   const ymin = 0, ymax = 1023;
   const x = (i)=> 40 + (W-50)*(t[i]-xmin)/(xmax-xmin||1);
   const y = (v)=> (H-30) - (H-40)*(v-ymin)/(ymax-ymin||1);
+  ctx.strokeStyle = "#eee";
+  for(let ms=0; ms<=xmax; ms+=1000){ const gx=40 + (W-50)*(ms-xmin)/(xmax-xmin||1); ctx.beginPath(); ctx.moveTo(gx,10); ctx.lineTo(gx,H-30); ctx.stroke(); }
+  ctx.fillStyle = "#333"; ctx.fillText("time, ms", W-70, H-12); ctx.fillText("ADC", 8, 20);
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 1.2; ctx.beginPath(); for(let i=0;i<n;i++){ const xi=x(i), yi=y(raw[i]); if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);} ctx.stroke();
+  ctx.strokeStyle = "#1a73e8"; ctx.lineWidth = 1.4; ctx.beginPath(); for(let i=0;i<n;i++){ const xi=x(i), yi=y(filt[i]); if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);} ctx.stroke();
+  ctx.strokeStyle = "#e8711a"; ctx.setLineDash([4,4]); ctx.beginPath(); const yc = y(potCenter); ctx.moveTo(40,yc); ctx.lineTo(W-10,yc); ctx.stroke(); ctx.setLineDash([]);
+  ctx.restore();
+}
 
-  // grid (time)
-  ctx.strokeStyle = '#eee';
-  for(let ms=0; ms<=xmax; ms+=1000){
-    const gx = 40 + (W-50)*(ms-xmin)/(xmax-xmin||1);
-    ctx.beginPath(); ctx.moveTo(gx,10); ctx.lineTo(gx,H-30); ctx.stroke();
-  }
-  // labels
-  ctx.fillStyle = '#333';
-  ctx.fillText('time, ms', W-70, H-12);
-  ctx.fillText('ADC', 8, 20);
+function drawErrChart(t, err){
+  const c = document.getElementById("chartErr");
+  const ctx = c.getContext("2d"); const W=c.width, H=c.height;
+  ctx.clearRect(0,0,W,H); ctx.save();
+  ctx.strokeStyle="#999"; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(40,10); ctx.lineTo(40,H-30); ctx.lineTo(W-10,H-30); ctx.stroke();
+  const n = err.length; const xmin=0, xmax=t[n-1]||1;
+  let emin=0, emax=0; for(let i=0;i<n;i++){ if(err[i]<emin) emin=err[i]; if(err[i]>emax) emax=err[i]; }
+  const eabs=Math.max(Math.abs(emin), Math.abs(emax), 10); const ymin=-eabs, ymax=eabs;
+  const x=(i)=> 40 + (W-50)*(t[i]-xmin)/(xmax-xmin||1);
+  const y=(v)=> (H-30) - (H-40)*(v-ymin)/(ymax-ymin||1);
+  ctx.strokeStyle="#eee"; for(let ms=0; ms<=xmax; ms+=1000){ const gx=40 + (W-50)*(ms-xmin)/(xmax-xmin||1); ctx.beginPath(); ctx.moveTo(gx,10); ctx.lineTo(gx,H-30); ctx.stroke(); }
+  ctx.strokeStyle="#bbb"; ctx.setLineDash([4,4]); ctx.beginPath(); const y0=y(0); ctx.moveTo(40,y0); ctx.lineTo(W-10,y0); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle="#333"; ctx.fillText("err (ADC)", 8, 20); ctx.fillText("time, ms", W-70, H-12);
+  ctx.beginPath(); ctx.lineWidth=1.4; for(let i=0;i<n;i++){ const xi=x(i), yi=y(err[i]); if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);} ctx.stroke();
+  ctx.restore();
+}
 
-  // plot raw
-  ctx.strokeStyle = '#444';
-  ctx.lineWidth = 1.2;
-  ctx.beginPath();
-  for(let i=0;i<n;i++){
-    const xi=x(i), yi=y(raw[i]);
-    if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);
-  }
-  ctx.stroke();
-
-  // plot filtered
-  ctx.strokeStyle = '#1a73e8';
-  ctx.lineWidth = 1.4;
-  ctx.beginPath();
-  for(let i=0;i<n;i++){
-    const xi=x(i), yi=y(filt[i]);
-    if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);
-  }
-  ctx.stroke();
-
-  // target/center line
-  ctx.strokeStyle = '#e8711a';
-  ctx.setLineDash([4,4]);
-  ctx.beginPath();
-  const yc = y(%POT_CENTER%);
-  ctx.moveTo(40, yc); ctx.lineTo(W-10, yc); ctx.stroke();
-  ctx.setLineDash([]);
-
+function drawPidChart(t, p, i, d){
+  const c = document.getElementById("chartPid"); const ctx=c.getContext("2d"); const W=c.width, H=c.height;
+  ctx.clearRect(0,0,W,H); ctx.save();
+  ctx.strokeStyle="#999"; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(40,10); ctx.lineTo(40,H-30); ctx.lineTo(W-10,H-30); ctx.stroke();
+  if(!p || !i || !d || !p.length){ ctx.restore(); return; }
+  const n = Math.min(p.length, i.length, d.length, t.length);
+  const xmin=0, xmax=t[n-1]||1;
+  let vmin=0, vmax=0; for(let arr of [p,i,d]) for(let v of arr){ if(v<vmin) vmin=v; if(v>vmax) vmax=v; }
+  const vabs=Math.max(Math.abs(vmin), Math.abs(vmax), 10); const ymin=-vabs, ymax=vabs;
+  const x=(idx)=> 40 + (W-50)*(t[idx]-xmin)/(xmax-xmin||1);
+  const y=(v)=> (H-30) - (H-40)*(v-ymin)/(ymax-ymin||1);
+  ctx.strokeStyle="#eee"; for(let ms=0; ms<=xmax; ms+=1000){ const gx=40 + (W-50)*(ms-xmin)/(xmax-xmin||1); ctx.beginPath(); ctx.moveTo(gx,10); ctx.lineTo(gx,H-30); ctx.stroke(); }
+  ctx.strokeStyle="#bbb"; ctx.setLineDash([4,4]); ctx.beginPath(); const y0=y(0); ctx.moveTo(40,y0); ctx.lineTo(W-10,y0); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle="#333"; ctx.fillText("µs", 12, 20); ctx.fillText("time, ms", W-70, H-12);
+  const draw=(arr)=>{ ctx.beginPath(); ctx.lineWidth=1.4; for(let i=0;i<n;i++){ const xi=x(i), yi=y(arr[i]); if(i===0) ctx.moveTo(xi,yi); else ctx.lineTo(xi,yi);} ctx.stroke(); };
+  ctx.strokeStyle = '#d32f2f'; draw(p); // P - red
+  ctx.strokeStyle = '#1976d2'; draw(i); // I - blue
+  ctx.strokeStyle = '#388e3c'; draw(d); // D - green
+  draw(p); draw(i); draw(d);
   ctx.restore();
 }
 setInterval(refresh, 500);
@@ -556,6 +574,22 @@ void HandleData(){
   j += "\"err\":[";
   for (uint16_t i=0;i<SampleCount;i++){ j += String(AdcErr[i]); if (i+1<SampleCount) j += ","; }
   j += "]";
+
+  // P term (µs)
+  j += ",\"p\":[";
+  for (uint16_t i=0;i<SampleCount;i++){ j += String(PUs[i]); if (i+1<SampleCount) j += ","; }
+  j += "]";
+
+  // I term (µs)
+  j += ",\"i\":[";
+  for (uint16_t i=0;i<SampleCount;i++){ j += String(IUs[i]); if (i+1<SampleCount) j += ","; }
+  j += "]";
+
+  // D term (µs)
+  j += ",\"d\":[";
+  for (uint16_t i=0;i<SampleCount;i++){ j += String(DUs[i]); if (i+1<SampleCount) j += ","; }
+  j += "]";
+
 
   j += "}";
   Web.send(200, "application/json", j);
