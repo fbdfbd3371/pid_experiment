@@ -273,6 +273,7 @@ static const char* HTML_PAGE PROGMEM = R"HTML(
   <legend>Chart (after experiment)</legend>
   <div style="display:flex;gap:8px;align-items:center">
     <button onclick="loadChart()">Load chart</button>
+    <button onclick="savePng()">Save PNG</button>
     <small id=meta>—</small>
   </div>
   <canvas id="chart" width="800" height="280"></canvas>
@@ -287,6 +288,19 @@ function debounce(fn, ms){
   return function(...args){
     clearTimeout(debounceT);
     debounceT = setTimeout(()=>fn.apply(this,args), ms);
+  }
+}
+
+function savePng(){
+  const c = document.getElementById('chart');
+  if(!c){ alert('Chart not found.'); return; }
+  const link = document.createElement('a');
+  link.href = c.toDataURL('image/png');
+  link.download = `experiment_${Date.now()}.png`;
+  if (typeof link.download === 'undefined') {
+    window.open(link.href, '_blank');
+  } else {
+    link.click();
   }
 }
 const applyNow = debounce(async function(){
